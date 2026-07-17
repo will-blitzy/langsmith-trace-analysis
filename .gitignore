@@ -1,0 +1,29 @@
+# Environment
+.env
+
+# Export output (keep the folder, ignore contents)
+exports/*
+!exports/.gitkeep
+
+# Scratch trace files
+trace*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
