@@ -262,7 +262,7 @@ def resolve_blobs(tree):
 # Output helpers
 # ---------------------------------------------------------------------------
 
-_MAX_PART_BYTES = 480_000_000  # 480 MB decimal — leaves headroom for indent-nesting overhead
+_DEFAULT_MAX_MB = 30
 
 
 def _count_tree(node):
@@ -271,12 +271,12 @@ def _count_tree(node):
     return 1 + _count_tree(node.get("child_runs", []))
 
 
-def _write_output(result, out_path):
+def _write_output(result, out_path, max_part_bytes):
     """
     Write result to out_path, splitting into _part1, _part2, … files when the
-    serialized size would exceed 500 MB.  Only trace-tree results (a root dict
-    with child_runs) can be split; flat lists are always written as one file.
-    Returns the list of paths actually written.
+    serialized size would exceed max_part_bytes.  Only trace-tree results (a
+    root dict with child_runs) can be split; flat lists are always written as
+    one file.  Returns the list of paths actually written.
     """
     if not isinstance(result, dict) or not result.get("child_runs"):
         with open(out_path, "w") as f:
@@ -294,7 +294,7 @@ def _write_output(result, out_path):
     ]
     total = root_overhead + sum(child_sizes)
 
-    if total <= _MAX_PART_BYTES:
+    if total <= max_part_bytes:
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2, default=str)
         print(f"  {out_path}  ({total / 1e6:.1f} MB)")
@@ -303,7 +303,7 @@ def _write_output(result, out_path):
     # Greedy bin-pack children into parts, each under the size cap
     parts, current_indices, current_sz = [], [], root_overhead
     for i, sz in enumerate(child_sizes):
-        if current_indices and current_sz + sz > _MAX_PART_BYTES:
+        if current_indices and current_sz + sz > max_part_bytes:
             parts.append(current_indices)
             current_indices, current_sz = [], root_overhead
         current_indices.append(i)
@@ -345,6 +345,8 @@ def main():
                    help="export name; files are written to exports/<name>/")
     p.add_argument("--out", default="runs_export.json",
                    help="filename inside the export folder (default: runs_export.json)")
+    p.add_argument("--max-mb", type=float, default=_DEFAULT_MAX_MB,
+                   help=f"max size per output file in MB (default: {_DEFAULT_MAX_MB})")
     a = p.parse_args()
 
     export_dir = os.path.join("exports", a.name)
@@ -367,7 +369,7 @@ def main():
     else:
         p.error("Provide --trace, --run-ids, or --project")
 
-    written = _write_output(result, out_path)
+    written = _write_output(result, out_path, int(a.max_mb * 1_000_000))
     parts_label = f"{len(written)} file(s)" if len(written) > 1 else "1 file"
     print(f"Wrote {count} run(s) across {parts_label} in {export_dir}/")
 
