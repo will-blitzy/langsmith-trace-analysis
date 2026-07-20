@@ -8,13 +8,14 @@ The target LangSmith instance (`langsmith.blitzy.com`) sits behind a Cloudflare 
 
 - Fetches an entire trace tree by root run ID (all child runs, fully nested)
 - Resolves S3-offloaded payloads concurrently so `inputs`/`outputs`/`error` fields are always populated
-- Auto-splits large exports into `_part1`, `_part2`, … files, each under 500 MB
+- Auto-splits large exports into `_part1`, `_part2`, … files at a configurable size (default 30 MB)
 - Organises output under `exports/<name>/` for easy management
+- Simple web UI for running exports and downloading results
 
 ## Requirements
 
 - Python 3.9+
-- pip packages: `requests`, `python-dotenv`
+- pip packages: `requests`, `python-dotenv`, `streamlit`
 
 ## Setup
 
@@ -44,33 +45,51 @@ Open `.env` and fill in the three values:
 
 ## Usage
 
-### Export a full trace (recommended)
+### Web UI (recommended)
+
+```bash
+./run.sh
+```
+
+Opens at **http://localhost:8501**. The UI lets you choose an export mode (Trace tree / Run IDs / Project), set the export name and per-file size limit, and download results directly from the browser.
+
+### CLI
+
+#### Export a full trace
 
 ```bash
 python src/export.py --name <label> --trace <root-run-id>
 ```
 
-Output is written to `exports/<label>/runs_export.json` (or `_part1.json`, `_part2.json`, … if the trace exceeds 480 MB).
+Output is written to `exports/<label>/runs_export.json` (or `_part1.json`, `_part2.json`, … if the trace exceeds the size cap).
 
-### Skip S3 blob resolution (faster, skeleton only)
+#### Control file size
+
+```bash
+python src/export.py --name <label> --trace <root-run-id> --max-mb 100
+```
+
+Default is 30 MB per file.
+
+#### Skip S3 blob resolution (faster, skeleton only)
 
 ```bash
 python src/export.py --name <label> --trace <root-run-id> --no-resolve-blobs
 ```
 
-### Export specific runs by ID
+#### Export specific runs by ID
 
 ```bash
 python src/export.py --name <label> --run-ids <id1> <id2> ...
 ```
 
-### Export recent runs from a project
+#### Export recent runs from a project
 
 ```bash
 python src/export.py --name <label> --project "my-project" --limit 50 --root-only
 ```
 
-### Custom output filename
+#### Custom output filename
 
 ```bash
 python src/export.py --name <label> --trace <root-run-id> --out my_trace.json
