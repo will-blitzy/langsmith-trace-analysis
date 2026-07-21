@@ -13,6 +13,10 @@ Usage:
     # Full trace tree by root run ID (recommended):
     python src/export.py --name my-export --trace <root-run-id>
 
+    # Multiple trace trees at once (comma- and/or space-separated):
+    python src/export.py --name my-export --trace <root-id-1>,<root-id-2>,<root-id-3>
+    python src/export.py --name my-export --trace <root-id-1> <root-id-2>
+
     # Skip S3 blob resolution (faster, leaves inputs/outputs empty):
     python src/export.py --name my-export --trace <root-run-id> --no-resolve-blobs
 
@@ -29,6 +33,7 @@ import base64
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import time
 
@@ -46,6 +51,11 @@ BASE_HOST = "https://langsmith.blitzy.com"
 _BLOB_WORKERS = 20
 _BLOB_RETRIES = 3
 _BLOB_BACKOFF = 0.5  # seconds; doubles each retry
+
+_QUERY_TIMEOUT = 120     # seconds; per /runs/query request (was 60, tight for big traces)
+_QUERY_RETRIES = 3       # retry a query that times out / drops the connection
+_QUERY_BACKOFF = 2.0     # seconds; doubles each retry
+_TRACE_PAUSE = 1.5       # seconds between traces in a batch, to ease API throttling
 
 
 # ---------------------------------------------------------------------------
@@ -107,18 +117,50 @@ def project_id(s, name):
     return sessions[0]["id"]
 
 
-def query_runs(s, pid, limit, root_only):
+def _post_query(s, body, timeout=_QUERY_TIMEOUT, retries=_QUERY_RETRIES):
+    """
+    POST /runs/query, retrying on network timeouts / dropped connections with
+    exponential backoff.  A batch of traces can throttle the API, so a slow
+    response should be retried rather than aborting the whole export.  Cloudflare
+    blocks and HTTP errors (raised by guard) are not retried — they won't recover
+    without a fresh cf_clearance.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return guard(s.post(f"{BASE}/runs/query", json=body, timeout=timeout))
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+        except requests.exceptions.HTTPError as exc:
+            # Transient gateway/upstream errors are worth retrying; other HTTP
+            # errors (4xx, etc.) are not and propagate immediately.
+            status = getattr(exc.response, "status_code", None)
+            if status not in (502, 503, 504):
+                raise
+            last_exc = exc
+        if attempt < retries - 1:
+            wait = _QUERY_BACKOFF * (2 ** attempt)
+            reason = getattr(getattr(last_exc, "response", None),
+                             "status_code", None) or type(last_exc).__name__
+            print(f"  query error ({reason}); retry "
+                  f"{attempt + 1}/{retries - 1} in {wait:.0f}s…", flush=True)
+            time.sleep(wait)
+    raise last_exc
+
+
+def query_runs(s, pid, limit, root_only, timeout=_QUERY_TIMEOUT):
     body = {"session": [pid], "limit": limit, "order": "desc"}
     if root_only:
         body["is_root"] = True
-    r = guard(s.post(f"{BASE}/runs/query", json=body, timeout=60))
+    r = _post_query(s, body, timeout=timeout)
     return r.json().get("runs", [])
 
 
-def get_trace(s, root_run_id):
+def get_trace(s, root_run_id, timeout=_QUERY_TIMEOUT):
     """Fetch all runs in a trace and return them nested as a tree."""
     body = {"trace": root_run_id}
-    r = guard(s.post(f"{BASE}/runs/query", json=body, timeout=60))
+    r = _post_query(s, body, timeout=timeout)
     runs = r.json().get("runs", [])
     if not runs:
         return get_run(s, root_run_id)
@@ -271,56 +313,121 @@ def _count_tree(node):
     return 1 + _count_tree(node.get("child_runs", []))
 
 
-def _write_output(result, out_path, max_part_bytes):
-    """
-    Write result to out_path, splitting into _part1, _part2, … files when the
-    serialized size would exceed max_part_bytes.  Only trace-tree results (a
-    root dict with child_runs) can be split; flat lists are always written as
-    one file.  Returns the list of paths actually written.
-    """
-    if not isinstance(result, dict) or not result.get("child_runs"):
-        with open(out_path, "w") as f:
-            json.dump(result, f, indent=2, default=str)
-        print(f"  {out_path}  ({os.path.getsize(out_path) / 1e6:.1f} MB)")
-        return [out_path]
+def _is_tree_list(result):
+    """True for a list of trace trees (each a dict carrying child_runs).
 
-    root_meta = {k: v for k, v in result.items() if k != "child_runs"}
+    Distinguishes a multi-`--trace` result from a flat list of runs produced by
+    --run-ids / --project, whose runs never carry a child_runs key.
+    """
+    return isinstance(result, list) and any(
+        isinstance(r, dict) and "child_runs" in r for r in result
+    )
+
+
+def _dump_json(obj, path):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2, default=str)
+    print(f"  {path}  ({os.path.getsize(path) / 1e6:.1f} MB)")
+
+
+def _split_tree_payloads(tree, max_part_bytes):
+    """
+    Split one trace tree into a list of tree-dicts whose serialized size each
+    stays under max_part_bytes where possible.  A tree that already fits is
+    returned as [tree].  Otherwise the root metadata is repeated in every
+    payload and the child subtrees are greedily bin-packed across payloads.  A
+    single child subtree larger than the cap is placed alone (it cannot be split
+    further here, so that one payload may still exceed the cap).
+    """
+    if not isinstance(tree, dict) or not tree.get("child_runs"):
+        return [tree]
+
+    root_meta = {k: v for k, v in tree.items() if k != "child_runs"}
     root_overhead = len(json.dumps(root_meta, indent=2, default=str).encode())
-    children = result["child_runs"]
-
-    print(f"Measuring sizes for {len(children)} child subtrees …", flush=True)
+    children = tree["child_runs"]
     child_sizes = [
         len(json.dumps(c, indent=2, default=str).encode()) for c in children
     ]
-    total = root_overhead + sum(child_sizes)
+    if root_overhead + sum(child_sizes) <= max_part_bytes:
+        return [tree]
 
-    if total <= max_part_bytes:
-        with open(out_path, "w") as f:
-            json.dump(result, f, indent=2, default=str)
-        print(f"  {out_path}  ({total / 1e6:.1f} MB)")
+    groups, current, current_sz = [], [], root_overhead
+    for i, sz in enumerate(child_sizes):
+        if current and current_sz + sz > max_part_bytes:
+            groups.append(current)
+            current, current_sz = [], root_overhead
+        current.append(i)
+        current_sz += sz
+    if current:
+        groups.append(current)
+
+    return [
+        dict(root_meta, child_runs=[children[i] for i in idxs]) for idxs in groups
+    ]
+
+
+def _write_output(result, out_path, max_part_bytes):
+    """
+    Write result to out_path, splitting into _part1, _part2, … files when the
+    serialized size would exceed max_part_bytes.  Trace-tree results are split
+    by child subtree so no file exceeds the cap (a single subtree larger than
+    the cap is the only thing that can): a single tree is written as a bare
+    dict (one per part), and multiple trees (several --trace IDs) as a JSON
+    array, bin-packing tree payloads across parts.  Flat lists of runs
+    (--run-ids / --project) are always written as one file.  When output is
+    split, consumers should merge runs across files by id (parts may repeat a
+    root's metadata with disjoint child_runs).  Returns the paths written.
+    """
+    # Flat list of runs (--run-ids / --project): always one file.
+    if isinstance(result, list) and not _is_tree_list(result):
+        _dump_json(result, out_path)
         return [out_path]
 
-    # Greedy bin-pack children into parts, each under the size cap
-    parts, current_indices, current_sz = [], [], root_overhead
-    for i, sz in enumerate(child_sizes):
-        if current_indices and current_sz + sz > max_part_bytes:
-            parts.append(current_indices)
-            current_indices, current_sz = [], root_overhead
-        current_indices.append(i)
-        current_sz += sz
-    if current_indices:
-        parts.append(current_indices)
+    # Multiple trace trees: JSON array, split so no file exceeds the cap.
+    if _is_tree_list(result):
+        print(f"Measuring sizes for {len(result)} trace tree(s) …", flush=True)
+        payloads = []
+        for tree in result:
+            payloads.extend(_split_tree_payloads(tree, max_part_bytes))
+        sizes = [len(json.dumps(p, indent=2, default=str).encode()) for p in payloads]
+
+        if sum(sizes) <= max_part_bytes:
+            _dump_json(payloads, out_path)
+            return [out_path]
+
+        groups, current, current_sz = [], [], 0
+        for i, sz in enumerate(sizes):
+            if current and current_sz + sz > max_part_bytes:
+                groups.append(current)
+                current, current_sz = [], 0
+            current.append(i)
+            current_sz += sz
+        if current:
+            groups.append(current)
+
+        base, ext = os.path.splitext(out_path)
+        written = []
+        for n, idxs in enumerate(groups, 1):
+            path = f"{base}_part{n}{ext}"
+            _dump_json([payloads[i] for i in idxs], path)
+            written.append(path)
+        return written
+
+    # Single trace tree: bare dict, split by child subtree when oversized.
+    if isinstance(result, dict) and result.get("child_runs"):
+        print(f"Measuring sizes for {len(result['child_runs'])} child subtrees …",
+              flush=True)
+    payloads = _split_tree_payloads(result, max_part_bytes)
+    if len(payloads) == 1:
+        _dump_json(result, out_path)
+        return [out_path]
 
     base, ext = os.path.splitext(out_path)
     written = []
-    for n, indices in enumerate(parts, 1):
+    for n, payload in enumerate(payloads, 1):
         path = f"{base}_part{n}{ext}"
-        part = dict(root_meta, child_runs=[children[i] for i in indices])
-        with open(path, "w") as f:
-            json.dump(part, f, indent=2, default=str)
-        print(f"  {path}  ({os.path.getsize(path) / 1e6:.1f} MB)")
+        _dump_json(payload, path)
         written.append(path)
-
     return written
 
 
@@ -329,12 +436,33 @@ def _write_output(result, out_path, max_part_bytes):
 # ---------------------------------------------------------------------------
 
 
+def parse_ids(raw):
+    """
+    Split run IDs from one or more raw strings on commas, whitespace, and
+    newlines.  Trims blanks and de-duplicates while preserving first-seen
+    order.  Accepts a single string or a list of strings (e.g. argparse's
+    nargs="+"), so `--run-ids id1,id2 id3` and a comma-pasted UI blob both work.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    seen, ids = set(), []
+    for chunk in raw or []:
+        for token in re.split(r"[,\s]+", chunk):
+            token = token.strip()
+            if token and token not in seen:
+                seen.add(token)
+                ids.append(token)
+    return ids
+
+
 def main():
     p = argparse.ArgumentParser(description="Export LangSmith runs/traces to JSON")
-    p.add_argument("--trace", metavar="ROOT_RUN_ID",
-                   help="fetch full trace tree for this root run ID")
+    p.add_argument("--trace", nargs="+", metavar="ROOT_RUN_ID",
+                   help="fetch full trace tree(s) for these root run ID(s); "
+                        "IDs may be comma- and/or space-separated")
     p.add_argument("--run-ids", nargs="+",
-                   help="fetch individual runs by ID (flat, no children)")
+                   help="fetch individual runs by ID (flat, no children); "
+                        "IDs may be comma- and/or space-separated")
     p.add_argument("--project",
                    help="fetch recent runs from a named project")
     p.add_argument("--limit", type=int, default=25)
@@ -347,6 +475,9 @@ def main():
                    help="filename inside the export folder (default: runs_export.json)")
     p.add_argument("--max-mb", type=float, default=_DEFAULT_MAX_MB,
                    help=f"max size per output file in MB (default: {_DEFAULT_MAX_MB})")
+    p.add_argument("--timeout", type=int, default=_QUERY_TIMEOUT,
+                   help=f"per-query network timeout in seconds "
+                        f"(default: {_QUERY_TIMEOUT})")
     a = p.parse_args()
 
     export_dir = os.path.join("exports", a.name)
@@ -354,17 +485,45 @@ def main():
     out_path = os.path.join(export_dir, a.out)
 
     s = session()
+    failures = []  # (id, exception) for traces that could not be fetched
 
     if a.trace:
-        result = get_trace(s, a.trace)
-        if not a.no_resolve_blobs:
-            resolve_blobs(result)
+        trace_ids = parse_ids(a.trace)
+        if not trace_ids:
+            p.error("--trace given but no valid root run IDs were parsed")
+        trees = []
+        for i, rid in enumerate(trace_ids):
+            if len(trace_ids) > 1:
+                print(f"[{i + 1}/{len(trace_ids)}] trace {rid}", flush=True)
+            try:
+                tree = get_trace(s, rid, timeout=a.timeout)
+                if not a.no_resolve_blobs:
+                    resolve_blobs(tree)
+                trees.append(tree)
+            except SystemExit:
+                raise  # Cloudflare block etc. — no point continuing the batch
+            except Exception as exc:  # isolate one trace's failure from the rest
+                failures.append((rid, exc))
+                print(f"  ERROR  trace={rid}  {type(exc).__name__}: {exc}",
+                      flush=True)
+            # Pace the batch to ease API throttling between traces.
+            if i < len(trace_ids) - 1:
+                time.sleep(_TRACE_PAUSE)
+        if not trees:
+            sys.exit(f"All {len(trace_ids)} trace(s) failed; nothing written.")
+        # A single ID keeps the original single-tree output; multiple IDs
+        # produce a list of trees.
+        result = trees[0] if len(trees) == 1 else trees
         count = _count_tree(result)
     elif a.run_ids:
-        result = [get_run(s, rid) for rid in a.run_ids]
+        run_ids = parse_ids(a.run_ids)
+        if not run_ids:
+            p.error("--run-ids given but no valid IDs were parsed")
+        result = [get_run(s, rid) for rid in run_ids]
         count = len(result)
     elif a.project:
-        result = query_runs(s, project_id(s, a.project), a.limit, a.root_only)
+        result = query_runs(s, project_id(s, a.project), a.limit, a.root_only,
+                            timeout=a.timeout)
         count = len(result)
     else:
         p.error("Provide --trace, --run-ids, or --project")
@@ -372,6 +531,15 @@ def main():
     written = _write_output(result, out_path, int(a.max_mb * 1_000_000))
     parts_label = f"{len(written)} file(s)" if len(written) > 1 else "1 file"
     print(f"Wrote {count} run(s) across {parts_label} in {export_dir}/")
+
+    if failures:
+        # Partial success: successful traces are still written above, so exit 0
+        # (the UI shows their downloads).  Only a total failure exits non-zero,
+        # which is handled earlier.  Re-run the skipped IDs to fill the gaps.
+        print(f"\nWARNING: {len(failures)} of {len(trees) + len(failures)} "
+              f"trace(s) failed and were skipped:")
+        for rid, exc in failures:
+            print(f"  {rid}  {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":
