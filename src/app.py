@@ -6,6 +6,8 @@ import subprocess
 
 import streamlit as st
 
+from export import parse_ids
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 try:
@@ -29,9 +31,17 @@ with col2:
     max_mb = st.number_input("Max MB per file", min_value=1, value=30)
 
 if mode == "Trace tree":
-    trace_id = st.text_input("Root run ID")
+    trace_ids_raw = st.text_area(
+        "Root run ID(s) (comma- or newline-separated)",
+        help="One or more root run IDs to export as full trace trees, "
+             "separated by commas, spaces, or newlines.",
+    )
 elif mode == "Run IDs":
-    run_ids_raw = st.text_area("Run IDs (one per line)")
+    run_ids_raw = st.text_area(
+        "Run IDs (comma- or newline-separated)",
+        help="Paste IDs of errored-out runs to re-export them, "
+             "separated by commas, spaces, or newlines.",
+    )
 else:
     project = st.text_input("Project name")
     col3, col4 = st.columns(2)
@@ -47,12 +57,13 @@ if st.button("Run Export", type="primary", disabled=not name):
            "--name", name, "--max-mb", str(max_mb)]
 
     if mode == "Trace tree":
-        if not trace_id.strip():
-            st.error("Root run ID is required.")
+        trace_ids = parse_ids(trace_ids_raw)
+        if not trace_ids:
+            st.error("Enter at least one root run ID.")
             st.stop()
-        cmd += ["--trace", trace_id.strip()]
+        cmd += ["--trace"] + trace_ids
     elif mode == "Run IDs":
-        ids = [x.strip() for x in run_ids_raw.splitlines() if x.strip()]
+        ids = parse_ids(run_ids_raw)
         if not ids:
             st.error("Enter at least one run ID.")
             st.stop()
