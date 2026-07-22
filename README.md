@@ -60,41 +60,12 @@ Opens at **http://localhost:8501**. The UI lets you choose an export mode (Trace
 #### Export a full trace
 
 ```bash
-python src/export.py --name <label> --trace <root-run-id>
+python src/export.py --name <label> --trace <root-run-id>, <root-run-id2>
 ```
 
-Output is written to `exports/<label>/runs_export.json` (or `_part1.json`, `_part2.json`, … if the trace exceeds the size cap).
+Output is written to `exports/<label>/runs_export.json` (or `_part1.json`, `_part2.json`, … if the trace exceeds the size cap, default 30 MB, set with `--max-mb`).
 
-#### Export several traces at once
-
-Pass multiple root run IDs, comma- and/or space-separated:
-
-```bash
-python src/export.py --name <label> --trace <root-id-1>,<root-id-2>,<root-id-3>
-python src/export.py --name <label> --trace <root-id-1> <root-id-2>
-```
-
-Each trace is fetched independently. If one fails (e.g. a transient gateway error or timeout), it is retried, then — if still failing — logged and skipped so the others still export; a `WARNING: N of M trace(s) failed` summary lists any skipped IDs at the end. Re-run just those IDs to fill the gaps.
-
-With more than one ID, the output is a **JSON array of trace trees** rather than a single root object (see [Output structure](#output-structure)).
-
-#### Control file size
-
-```bash
-python src/export.py --name <label> --trace <root-run-id> --max-mb 100
-```
-
-Default is 30 MB per file. Splitting happens at the granularity of a root's direct-child subtrees, so a single subtree larger than the cap is written whole in its own file (that one file may exceed `--max-mb`).
-
-#### Adjust the network timeout
-
-```bash
-python src/export.py --name <label> --trace <root-run-id> --timeout 240
-```
-
-Per-query network timeout in seconds (default 120). Increase it for very large traces that are slow to query.
-
-#### Skip S3 blob resolution (faster, skeleton only)
+### Skip S3 blob resolution (faster, skeleton only)
 
 ```bash
 python src/export.py --name <label> --trace <root-run-id> --no-resolve-blobs
@@ -120,6 +91,49 @@ python src/export.py --name <label> --project "my-project" --limit 50 --root-onl
 ```bash
 python src/export.py --name <label> --trace <root-run-id> --out my_trace.json
 ```
+
+### Slim mode (much smaller files)
+
+In a LangGraph agent trace, ~95% of the bytes are exact-duplicate messages — every
+LLM call re-sends the growing conversation (a large system prompt plus the whole
+history), so the same message objects repeat thousands of times. `--slim` collapses
+that redundancy:
+
+```bash
+python src/export.py --name <label> --trace <root-run-id> --slim
+```
+
+It does two things, both **lossless**:
+
+1. **Drops fields with no analytical value** — resolved S3 URL pointers
+   (`inputs_s3_urls`, `outputs_s3_urls`, `s3_urls`), the runnable config
+   (`serialized`), the UI link (`app_path`), retention/billing metadata
+   (`trace_tier`, `ttl_seconds`, `trace_upgrade`, `in_dataset`), and per-message
+   provider diagnostics (`response_metadata`, `usage_metadata`).
+2. **Deduplicates messages** — each unique message is stored once in a per-file
+   `_messages` pool and every occurrence is replaced with a short reference key
+   (`"@m:…"`). Each output file stays self-contained.
+
+Everything that shows *what the agent decided* is preserved: `content`,
+`tool_calls`, `invalid_tool_calls`, `outputs`, `error`, `status`, and `extra`
+(graph state). Typical result: **~85–90% smaller** (e.g. a 3.6 GB export → ~400 MB).
+
+Optionally cap oversized content blocks (the only **lossy** lever, off by default):
+
+```bash
+# truncate any single message content block larger than 64 KB
+python src/export.py --name <label> --trace <root-run-id> --slim --max-content-kb 64
+```
+
+### Expand a slim export back to full form
+
+```bash
+# a single file, or a whole export directory
+python src/export.py --rehydrate exports/<label>/
+```
+
+Each `*.json` slim file is expanded to a matching `*.full.json` with every message
+reference replaced by its original object.
 
 ## Output structure
 
